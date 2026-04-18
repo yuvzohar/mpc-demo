@@ -23,7 +23,7 @@ from core.mcp_host import MCPHost
 from .analyzer import SecurityAnalyzer
 from .discovery import MCPDiscovery
 from .enforcer import SecurityEnforcer
-from .models import SecurityEvent, SessionInfo, Severity
+from .models import PolicyAction, SecurityEvent, SessionInfo, Severity
 from .proxy import MCPSecurityProxy
 
 # ── Globals ────────────────────────────────────────────────────────────────────
@@ -270,3 +270,78 @@ async def _run_scenario_bg(threat_number: int, session_id: str) -> None:
         if session_id in _sessions:
             _sessions[session_id].status = "completed"
             await _broadcast({"type": "session_update", "data": _sessions[session_id].to_dict()})
+
+
+# ── External ingest (used by main.py simulator) ─────────────────────────────────
+
+class IngestSession(BaseModel):
+    session_id: str
+    threat_scenario: Optional[str] = None
+    status: str = "active"
+
+
+class IngestEvent(BaseModel):
+    id: str
+    timestamp: str
+    session_id: str
+    tool_name: str
+    arguments: dict
+    result_preview: str = ""
+    risk_score: int
+    severity: str
+    anomaly_detected: bool
+    pattern_matched: Optional[str] = None
+    threat_name: Optional[str] = None
+    action_taken: str
+    impact: str
+    handled_by: str
+
+
+@app.post("/api/sessions/ingest")
+async def ingest_session(body: IngestSession):
+    """Create or update a session pushed from the external CLI simulator."""
+    if body.session_id not in _sessions:
+        _sessions[body.session_id] = SessionInfo(
+            session_id=body.session_id,
+            threat_scenario=body.threat_scenario,
+            started_at=datetime.now(),
+            last_activity=datetime.now(),
+        )
+    else:
+        _sessions[body.session_id].status = body.status
+        _sessions[body.session_id].last_activity = datetime.now()
+
+    await _broadcast({"type": "session_update", "data": _sessions[body.session_id].to_dict()})
+    return {"ok": True}
+
+
+@app.post("/api/events/ingest")
+async def ingest_event(body: IngestEvent):
+    """Ingest a security event pushed from the external CLI simulator."""
+    # Auto-create session if it doesn't exist yet
+    if body.session_id not in _sessions:
+        _sessions[body.session_id] = SessionInfo(
+            session_id=body.session_id,
+            threat_scenario=None,
+            started_at=datetime.now(),
+            last_activity=datetime.now(),
+        )
+
+    event = SecurityEvent(
+        id=body.id,
+        timestamp=datetime.fromisoformat(body.timestamp),
+        session_id=body.session_id,
+        tool_name=body.tool_name,
+        arguments=body.arguments,
+        result=body.result_preview,
+        risk_score=body.risk_score,
+        severity=Severity(body.severity),
+        anomaly_detected=body.anomaly_detected,
+        pattern_matched=body.pattern_matched,
+        threat_name=body.threat_name,
+        action_taken=PolicyAction(body.action_taken),
+        impact=body.impact,
+        handled_by=body.handled_by,
+    )
+    await _handle_security_event(event)
+    return {"ok": True}

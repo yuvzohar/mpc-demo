@@ -9,13 +9,19 @@ Usage:
     python main.py                        # Demo mode (no API key needed)
     ANTHROPIC_API_KEY=sk-... python main.py   # Real Claude AI mode
     DEMO_MODE=false ANTHROPIC_API_KEY=sk-... python main.py
+
+Set DASHBOARD_URL=http://localhost:8000 (default) to forward events to the
+running dashboard so Live Events appear in real time.
 """
 import asyncio
 import os
 import sys
+import uuid
 
 # Ensure repo root is on the path
 sys.path.insert(0, os.path.dirname(__file__))
+
+import httpx
 
 from rich.console import Console
 from rich.panel import Panel
@@ -28,6 +34,11 @@ from core.database import setup_database
 from core.mcp_host import MCPHost
 from core.display import console, demo_mode_banner, print_divider, severity_badge
 
+from dashboard.analyzer import SecurityAnalyzer
+from dashboard.enforcer import SecurityEnforcer
+from dashboard.models import SecurityEvent
+from dashboard.proxy import MCPSecurityProxy
+
 from threats.t01_prompt_injection   import T01PromptInjection
 from threats.t02_auth_abuse         import T02AuthAbuse
 from threats.t03_data_exfiltration  import T03DataExfiltration
@@ -36,6 +47,8 @@ from threats.t05_resource_exhaustion  import T05ResourceExhaustion
 from threats.t06_supply_chain        import T06SupplyChain
 from threats.t07_business_logic      import T07BusinessLogicAbuse
 from threats.t08_shadow_agent        import T08ShadowAgent
+
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:8000")
 
 DB_PATH = "demo.db"
 
@@ -117,6 +130,14 @@ def print_banner(demo_mode: bool) -> None:
     console.print()
 
 
+async def _post_to_dashboard(client: httpx.AsyncClient, path: str, data: dict) -> None:
+    """Fire-and-forget POST to the dashboard; silently swallows errors."""
+    try:
+        await client.post(f"{DASHBOARD_URL}{path}", json=data, timeout=2.0)
+    except Exception:
+        pass
+
+
 async def main() -> None:
     demo_mode = os.getenv("DEMO_MODE", "true").lower() != "false"
 
@@ -126,6 +147,20 @@ async def main() -> None:
     setup_database(DB_PATH)
     console.print("[dim]Starting MCP server subprocess...[/dim]")
 
+    # Check if dashboard is reachable and show a hint
+    async with httpx.AsyncClient() as _probe:
+        try:
+            r = await _probe.get(f"{DASHBOARD_URL}/api/policies", timeout=1.0)
+            console.print(
+                f"[green]✓[/green] Dashboard detected at [bold]{DASHBOARD_URL}[/bold] "
+                f"— live events will be forwarded\n"
+            )
+        except Exception:
+            console.print(
+                f"[dim]Dashboard not detected at {DASHBOARD_URL} "
+                f"(run run_dashboard.py to see live events)[/dim]\n"
+            )
+
     try:
         async with MCPHost(DB_PATH) as host:
             tools = host.list_tools()
@@ -134,42 +169,79 @@ async def main() -> None:
                 f"[bold]{len(tools)}[/bold] tools registered\n"
             )
 
-            while True:
-                console.print(Rule("[bold bright_blue]SELECT A THREAT SCENARIO[/bold bright_blue]",
-                                   style="bright_blue"))
-                console.print(build_menu_table())
-                console.print()
-                console.print("[dim]  Enter 0 to quit[/dim]")
-                console.print()
+            # Shared components for the security proxy
+            analyzer = SecurityAnalyzer()
+            enforcer = SecurityEnforcer()
 
-                try:
-                    choice = IntPrompt.ask("[bold cyan]Select threat number[/bold cyan]")
-                except (KeyboardInterrupt, EOFError):
-                    break
+            async with httpx.AsyncClient() as http:
 
-                if choice == 0:
-                    break
+                def make_event_callback(client: httpx.AsyncClient):
+                    async def on_event(event: SecurityEvent) -> None:
+                        await _post_to_dashboard(client, "/api/events/ingest", event.to_dict())
+                    return on_event
 
-                if choice not in SCENARIOS:
-                    console.print(f"[red]Invalid choice: {choice}. Enter 1-8 or 0.[/red]")
-                    continue
+                proxy = MCPSecurityProxy(
+                    real_host=host,
+                    analyzer=analyzer,
+                    enforcer=enforcer,
+                    on_event=make_event_callback(http),
+                )
 
-                scenario_cls = SCENARIOS[choice]
-                scenario = scenario_cls(mcp_host=host, demo_mode=demo_mode)
+                while True:
+                    console.print(Rule("[bold bright_blue]SELECT A THREAT SCENARIO[/bold bright_blue]",
+                                       style="bright_blue"))
+                    console.print(build_menu_table())
+                    console.print()
+                    console.print("[dim]  Enter 0 to quit[/dim]")
+                    console.print()
 
-                console.print()
-                try:
-                    await scenario.run()
-                except Exception as exc:
-                    console.print(f"[bold red]Error during scenario: {exc}[/bold red]")
-                    import traceback
-                    console.print(f"[dim]{traceback.format_exc()}[/dim]")
+                    try:
+                        choice = IntPrompt.ask("[bold cyan]Select threat number[/bold cyan]")
+                    except (KeyboardInterrupt, EOFError):
+                        break
 
-                console.print()
-                try:
-                    Prompt.ask("[dim]Press Enter to return to menu[/dim]", default="")
-                except (KeyboardInterrupt, EOFError):
-                    break
+                    if choice == 0:
+                        break
+
+                    if choice not in SCENARIOS:
+                        console.print(f"[red]Invalid choice: {choice}. Enter 1-8 or 0.[/red]")
+                        continue
+
+                    # Create a session and register it with the dashboard
+                    session_id = f"cli_t{choice:02d}_{uuid.uuid4().hex[:6]}"
+                    _, _, threat_name, _ = _MENU_DATA[choice - 1]
+                    proxy.set_session(session_id)
+
+                    await _post_to_dashboard(http, "/api/sessions/ingest", {
+                        "session_id": session_id,
+                        "threat_scenario": threat_name,
+                        "status": "active",
+                    })
+
+                    scenario_cls = SCENARIOS[choice]
+                    # Pass proxy so every tool call is intercepted and forwarded
+                    scenario = scenario_cls(mcp_host=proxy, demo_mode=demo_mode)
+
+                    console.print()
+                    try:
+                        await scenario.run()
+                    except Exception as exc:
+                        console.print(f"[bold red]Error during scenario: {exc}[/bold red]")
+                        import traceback
+                        console.print(f"[dim]{traceback.format_exc()}[/dim]")
+
+                    # Mark session complete in the dashboard
+                    await _post_to_dashboard(http, "/api/sessions/ingest", {
+                        "session_id": session_id,
+                        "threat_scenario": threat_name,
+                        "status": "completed",
+                    })
+
+                    console.print()
+                    try:
+                        Prompt.ask("[dim]Press Enter to return to menu[/dim]", default="")
+                    except (KeyboardInterrupt, EOFError):
+                        break
 
     except KeyboardInterrupt:
         pass
